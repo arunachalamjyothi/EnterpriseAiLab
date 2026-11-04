@@ -1,50 +1,67 @@
 ﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
 
-// 1. Point to your local Ollama instance
-// Ollama provides an OpenAI-compatible endpoint at /v1
-string modelId = "llama3.2:1b";
-var endpoint = new Uri("http://localhost:11434/v1");
+//1. Point to your local Ollama container
+string modelId="llama3.2:1b";
+var endpoint=new Uri("http://localhost:11434/v1");
 
-// 2. Build the Semantic Kernel
-// apiKey can be any non-empty placeholder string (Ollama does not enforce auth)
-var builder = Kernel.CreateBuilder();
+var builder=Kernel.CreateBuilder();
 builder.AddOpenAIChatCompletion(
-    modelId: modelId,
-    apiKey: "local-ollama",
-    endpoint: endpoint
+    modelId:modelId,
+    apiKey:"local-ollama",
+    endpoint:endpoint
 );
 
-Kernel kernel = builder.Build();
+Kernel kernel=builder.Build();
+var chatService=kernel.GetRequiredService<IChatCompletionService>();
 
-// 3. Resolve the Chat Completion Service
-var chatService = kernel.GetRequiredService<IChatCompletionService>();
+//2. The Benchmark Prompt
+const string prompt="Name 3 unique, innovative names for an AI analytics company. Return only names separated by commas.";
 
-// 4. Construct System Instructions & User Prompt
-var history = new ChatHistory();
-history.AddSystemMessage("""
-    You are an Enterprise AI Architect assistant.
-    Provide concise, production-ready technical responses without conversational filler.
-    """);
-
-history.AddUserMessage("Explain why output tokens cost more than input tokens in 2 bullet points.");
-
-Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine($"[Invoking local {modelId} via Semantic Kernel & Ollama on Docker...]\n");
+//3. Test Function
+async Task RunExperimentAsync(string testName,OpenAIPromptExecutionSettings settings)
+{
+    Console.ForegroundColor=ConsoleColor.Cyan;
+    Console.WriteLine($"\n==============================================================");
+Console.WriteLine($"RUNNING: {testName} (Temperature={settings.Temperature},TopP={settings.TopP})");
+Console.WriteLine($"==============================================================");
 Console.ResetColor();
+for(int run=1;run<=3;run++)
+{
+    var history=new ChatHistory();
+    history.AddUserMessage(prompt);
 
-// 5. Invoke the local model
-var response = await chatService.GetChatMessageContentAsync(
-    chatHistory: history,
-    kernel: kernel
-);
+    var response=await chatService.GetChatMessageContentAsync(
+        history,
+        executionSettings:settings,
+        kernel:kernel
+    );
 
-// 6. Display the Output
-Console.ForegroundColor = ConsoleColor.Green;
-Console.WriteLine(response.Content);
-Console.ResetColor();
+    Console.ForegroundColor=ConsoleColor.Green;
+    Console.WriteLine($"Run#{run}:{response.Content?.Trim()}");
+    Console.ResetColor();
+}
+}
 
-Console.WriteLine("\n-------------------------------------------");
-Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine("[Success: Model executed locally with 0 cloud API costs]");
-Console.ResetColor();
+//4. Experiment A: High Temperature(Creative/Non-deterministic)
+var creativeSettings=new OpenAIPromptExecutionSettings
+{
+    Temperature=1.0,
+    MaxTokens=150,
+    TopP=1.0
+};
+
+await RunExperimentAsync("Experiment A: Creative Drafting", creativeSettings);
+
+//5. Experiment B: Zero Temperature(Deterministic/ Enterprise Extraction)
+var deterministicSettings=new OpenAIPromptExecutionSettings
+{
+    Temperature=0.0,
+    MaxTokens=150,
+    TopP=0.1
+};
+
+await RunExperimentAsync("Experiment B: Strict Determinism",deterministicSettings);
+
+
