@@ -1,92 +1,128 @@
 ﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Embeddings;
+using Qdrant.Client;
+using Qdrant.Client.Grpc;
 
-// 1. Configure HttpClient pointing directly to Ollama's OpenAI-compatible endpoint
-var httpClient=new HttpClient
+const string collectionName = "enterprise_policies";
+const ulong vectorSize = 768; // nomic-embed-text output dimension
+
+// 1. Initialize Qdrant Client (gRPC port 6334)
+var qdrantClient = new QdrantClient("localhost", 6334);
+
+// 2. Configure Semantic Kernel with Local Ollama nomic-embed-text
+var httpClient = new HttpClient
 {
-    BaseAddress=new Uri("http://localhost:11434/v1")
+    BaseAddress = new Uri("http://localhost:11434/v1")
 };
 
-string modelId="nomic-embed-text";
-
-//2. Register embedding generation using the standard HttpClient overload
-var builder=Kernel.CreateBuilder();
+var builder = Kernel.CreateBuilder();
 builder.AddOpenAITextEmbeddingGeneration(
-    modelId:modelId,
+    modelId: "nomic-embed-text",
     apiKey: "local-ollama",
-    httpClient:httpClient
+    httpClient: httpClient
 );
 
-Kernel kernel=builder.Build();
+Kernel kernel = builder.Build();
 
-//3. Resolve the Embedding Service
-var embeddingService=kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+#pragma warning disable CS0618
+var embeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+#pragma warning restore CS0618
 
-//4. Target Phrases
-string phrase1="Client claims medical reimbursement";
-string phrase2="Health insurance payout request";
-string phrase3="The quick brown fox jumps over the lazy dog"; //Negative baseline
-
-Console.ForegroundColor=ConsoleColor.Cyan;
-Console.WriteLine("[Generating Dense Embeddings via local nomic-embed-text...]\n");
+Console.ForegroundColor = ConsoleColor.Cyan;
+Console.WriteLine("=== Day 5: Vector Store Ingestion & Retrieval Pipeline ===\n");
 Console.ResetColor();
 
-//5. Generate Vectors
-var embeddings=await embeddingService.GenerateEmbeddingsAsync(
-    [phrase1,phrase2,phrase3],
-    kernel:kernel
-);
-
-ReadOnlyMemory<float> vector1=embeddings[0];
-ReadOnlyMemory<float> vector2=embeddings[1];
-ReadOnlyMemory<float> vector3=embeddings[2];
-
-Console.WriteLine($"Vector 1 Dimension:{vector1.Length}floats");
-Console.WriteLine($"Vector 2 Dimension:{vector2.Length}floats");
-Console.WriteLine("-----------------------------------------");
-
-//6. Calculate Cosine Similatities
-float simRelated=CalculateCosineSimilarity(vector1.Span, vector2.Span);
-float simUnrelated=CalculateCosineSimilarity(vector1.Span, vector3.Span);
-
-//7. Output Results & Verification
-Console.ForegroundColor=ConsoleColor.Green;
-Console.WriteLine($"Phrase 1:\"{phrase1}\"");
-Console.WriteLine($"Phrase 2:\"{phrase2}\"");
-Console.WriteLine($"Cosine Similarity: {simRelated:F4} (Expected:>0.80 - High Semantic Alignment)");
-Console.ResetColor();
-
-Console.WriteLine("\n-------------------------------------------------");
-Console.ForegroundColor=ConsoleColor.Yellow;
-Console.WriteLine($"Phrase 1:\"{phrase1}\"");
-Console.WriteLine($"Phrase 3:\"{phrase3}\"");
-Console.WriteLine($"Cosine Similarity: {simUnrelated:F4}(Expected: Low Semantic Alignment)");
-Console.ResetColor();
-
-// Helper method: Cosine Similarity calculation in C#
-static float CalculateCosineSimilarity(ReadOnlySpan<float> vectorA, ReadOnlySpan<float> vectorB)
+// 3. Ensure Collection Exists (Recreate fresh for the spike)
+bool collectionExists = await qdrantClient.CollectionExistsAsync(collectionName);
+if (collectionExists)
 {
-    if(vectorA.Length!=vectorB.Length)
-    {
-        throw new ArgumentException("Vectors must have the same dimension length.");
-
-    }
-
-    float dotProduct=0.0f;
-    float normA=0.0f;
-    float normB=0.0f;
-
-    for(int i=0;i<vectorA.Length;i++)
-    {
-        dotProduct+=vectorA[i]*vectorB[i];
-        normA+=vectorA[i]*vectorA[i];
-        normB+=vectorB[i]*vectorB[i];
-    }
-
-    if(normA<=0.0f||normB<=0.0f)
-    {
-        return 0.0f;
-    }
-
-    return dotProduct/((float)Math.Sqrt(normA)*(float)Math.Sqrt(normB));
+    await qdrantClient.DeleteCollectionAsync(collectionName);
 }
+
+await qdrantClient.CreateCollectionAsync(
+    collectionName: collectionName,
+    vectorsConfig: new VectorParams
+    {
+        Size = vectorSize,
+        Distance = Distance.Cosine
+    }
+);
+Console.WriteLine($"[Collection '{collectionName}' created with vector size {vectorSize} and Cosine distance]");
+
+// 4. Define Mock Enterprise Policies
+var policies = new[]
+{
+    new
+    {
+        Id = 1UL,
+        PolicyId = "POL-HR-001",
+        Department = "HR",
+        Content = "Medical reimbursement and hospital invoice claims must be submitted via the internal HR portal within 30 days of discharge."
+    },
+    new
+    {
+        Id = 2UL,
+        PolicyId = "POL-IT-002",
+        Department = "IT",
+        Content = "Corporate laptops must have full-disk encryption enabled and must not connect to unsecured public Wi-Fi networks."
+    },
+    new
+    {
+        Id = 3UL,
+        PolicyId = "POL-FIN-003",
+        Department = "Finance",
+        Content = "Travel allowance claims and domestic flight bookings require line manager pre-approval before corporate card settlement."
+    }
+};
+
+// 5. Generate Dense Embeddings and Upsert into Qdrant
+Console.WriteLine("[Generating embeddings and upserting policy records...]");
+
+var contents = policies.Select(p => p.Content).ToList();
+var embeddings = await embeddingService.GenerateEmbeddingsAsync(contents, kernel: kernel);
+
+var points = new List<PointStruct>();
+for (int i = 0; i < policies.Length; i++)
+{
+    var point = new PointStruct
+    {
+        Id = policies[i].Id,
+        Vectors = embeddings[i].ToArray()
+    };
+    point.Payload.Add("policyId", policies[i].PolicyId);
+    point.Payload.Add("department", policies[i].Department);
+    point.Payload.Add("text", policies[i].Content);
+
+    points.Add(point);
+}
+
+await qdrantClient.UpsertAsync(collectionName, points);
+Console.WriteLine($"[Successfully upserted {points.Count} policy records into Qdrant]\n");
+
+// 6. Semantic Query: Fetch Top-1 Nearest Neighbor
+string query = "How do I submit hospital invoices?";
+Console.ForegroundColor = ConsoleColor.Yellow;
+Console.WriteLine($"User Query: \"{query}\"");
+Console.ResetColor();
+
+var queryEmbeddings = await embeddingService.GenerateEmbeddingsAsync([query], kernel: kernel);
+var queryVector = queryEmbeddings[0].ToArray();
+
+var searchResults = await qdrantClient.SearchAsync(
+    collectionName: collectionName,
+    vector: queryVector,
+    limit: 1
+);
+
+// 7. Display Top Result and Score
+Console.WriteLine("--------------------------------------------------------");
+Console.ForegroundColor = ConsoleColor.Green;
+foreach (var match in searchResults)
+{
+    Console.WriteLine($"Top Match Score : {match.Score:F4} (Cosine Similarity)");
+    Console.WriteLine($"Policy ID       : {match.Payload["policyId"].StringValue}");
+    Console.WriteLine($"Department      : {match.Payload["department"].StringValue}");
+    Console.WriteLine($"Matched Policy  : {match.Payload["text"].StringValue}");
+}
+Console.ResetColor();
+Console.WriteLine("--------------------------------------------------------");
