@@ -1,19 +1,15 @@
-﻿using Microsoft.SemanticKernel;
+﻿using System.Diagnostics;
+using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Embeddings;
 using Qdrant.Client;
 using Qdrant.Client.Grpc;
 
-const string collectionName = "enterprise_policies";
-const ulong vectorSize = 768; // nomic-embed-text output dimension
+const string collectionName = "enterprise_knowledge_base";
+const ulong vectorSize = 768; // nomic-embed-text dimension
 
-// 1. Initialize Qdrant Client (gRPC port 6334)
+// 1. Plumbing setup
 var qdrantClient = new QdrantClient("localhost", 6334);
-
-// 2. Configure Semantic Kernel with Local Ollama nomic-embed-text
-var httpClient = new HttpClient
-{
-    BaseAddress = new Uri("http://localhost:11434/v1")
-};
+var httpClient = new HttpClient { BaseAddress = new Uri("http://localhost:11434/v1") };
 
 var builder = Kernel.CreateBuilder();
 builder.AddOpenAITextEmbeddingGeneration(
@@ -29,100 +25,97 @@ var embeddingService = kernel.GetRequiredService<ITextEmbeddingGenerationService
 #pragma warning restore CS0618
 
 Console.ForegroundColor = ConsoleColor.Cyan;
-Console.WriteLine("=== Day 5: Vector Store Ingestion & Retrieval Pipeline ===\n");
+Console.WriteLine("================================================================");
+Console.WriteLine("  Day 6: End-to-End Semantic Pipeline with Latency Profiler     ");
+Console.WriteLine("================================================================\n");
 Console.ResetColor();
 
-// 3. Ensure Collection Exists (Recreate fresh for the spike)
-bool collectionExists = await qdrantClient.CollectionExistsAsync(collectionName);
-if (collectionExists)
+// 2. Fresh collection creation
+if (await qdrantClient.CollectionExistsAsync(collectionName))
 {
     await qdrantClient.DeleteCollectionAsync(collectionName);
 }
 
 await qdrantClient.CreateCollectionAsync(
     collectionName: collectionName,
-    vectorsConfig: new VectorParams
-    {
-        Size = vectorSize,
-        Distance = Distance.Cosine
-    }
+    vectorsConfig: new VectorParams { Size = vectorSize, Distance = Distance.Cosine }
 );
-Console.WriteLine($"[Collection '{collectionName}' created with vector size {vectorSize} and Cosine distance]");
 
-// 4. Define Mock Enterprise Policies
-var policies = new[]
+// 3. Ingestion paragraph
+string sourceDocument = 
+    "Employees traveling for international on-site client assignments are entitled to a daily " +
+    "per-diem allowance of $75 for meals and incidental expenses. All original hotel tax receipts " +
+    "and boarding passes must be uploaded to the Oracle ERP expense portal within 15 calendar days " +
+    "of returning to the home base location. Expenses exceeding the threshold require Director approval.";
+
+Console.WriteLine("Ingesting unstructured enterprise policy paragraph into Qdrant...\n");
+
+var ingestStopwatch = Stopwatch.StartNew();
+var docEmbeddings = await embeddingService.GenerateEmbeddingsAsync([sourceDocument], kernel: kernel);
+ingestStopwatch.Stop();
+
+var point = new PointStruct
 {
-    new
-    {
-        Id = 1UL,
-        PolicyId = "POL-HR-001",
-        Department = "HR",
-        Content = "Medical reimbursement and hospital invoice claims must be submitted via the internal HR portal within 30 days of discharge."
-    },
-    new
-    {
-        Id = 2UL,
-        PolicyId = "POL-IT-002",
-        Department = "IT",
-        Content = "Corporate laptops must have full-disk encryption enabled and must not connect to unsecured public Wi-Fi networks."
-    },
-    new
-    {
-        Id = 3UL,
-        PolicyId = "POL-FIN-003",
-        Department = "Finance",
-        Content = "Travel allowance claims and domestic flight bookings require line manager pre-approval before corporate card settlement."
-    }
+    Id = 1UL,
+    Vectors = docEmbeddings[0].ToArray()
 };
+point.Payload.Add("docId", "DOC-EXP-2026-INTL");
+point.Payload.Add("category", "Travel & Expense");
+point.Payload.Add("content", sourceDocument);
 
-// 5. Generate Dense Embeddings and Upsert into Qdrant
-Console.WriteLine("[Generating embeddings and upserting policy records...]");
+await qdrantClient.UpsertAsync(collectionName, [point]);
 
-var contents = policies.Select(p => p.Content).ToList();
-var embeddings = await embeddingService.GenerateEmbeddingsAsync(contents, kernel: kernel);
-
-var points = new List<PointStruct>();
-for (int i = 0; i < policies.Length; i++)
-{
-    var point = new PointStruct
-    {
-        Id = policies[i].Id,
-        Vectors = embeddings[i].ToArray()
-    };
-    point.Payload.Add("policyId", policies[i].PolicyId);
-    point.Payload.Add("department", policies[i].Department);
-    point.Payload.Add("text", policies[i].Content);
-
-    points.Add(point);
-}
-
-await qdrantClient.UpsertAsync(collectionName, points);
-Console.WriteLine($"[Successfully upserted {points.Count} policy records into Qdrant]\n");
-
-// 6. Semantic Query: Fetch Top-1 Nearest Neighbor
-string query = "How do I submit hospital invoices?";
-Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine($"User Query: \"{query}\"");
-Console.ResetColor();
-
-var queryEmbeddings = await embeddingService.GenerateEmbeddingsAsync([query], kernel: kernel);
-var queryVector = queryEmbeddings[0].ToArray();
-
-var searchResults = await qdrantClient.SearchAsync(
-    collectionName: collectionName,
-    vector: queryVector,
-    limit: 1
-);
-
-// 7. Display Top Result and Score
-Console.WriteLine("--------------------------------------------------------");
 Console.ForegroundColor = ConsoleColor.Green;
-foreach (var match in searchResults)
-{
-    Console.WriteLine($"Top Match Score : {match.Score:F4} (Cosine Similarity)");
-    Console.WriteLine($"Policy ID       : {match.Payload["policyId"].StringValue}");
-    Console.WriteLine($"Department      : {match.Payload["department"].StringValue}");
-    Console.WriteLine($"Matched Policy  : {match.Payload["text"].StringValue}");
-}
+Console.WriteLine($"[Document Indexed Successfully]");
+Console.WriteLine($"Ingestion Embedding Time (T1_ingest): {ingestStopwatch.ElapsedMilliseconds} ms\n");
 Console.ResetColor();
-Console.WriteLine("--------------------------------------------------------");
+
+// 4. Interactive retrieval loop with latency profiling
+Console.WriteLine("Type a natural language query (or type 'exit' to quit):");
+Console.WriteLine("Sample: 'How much food allowance do I get on international client trips?'\n");
+
+while (true)
+{
+    Console.ForegroundColor = ConsoleColor.Yellow;
+    Console.Write("\nQuery > ");
+    Console.ResetColor();
+    
+    string? query = Console.ReadLine();
+    if (string.IsNullOrWhiteSpace(query) || query.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase))
+    {
+        break;
+    }
+
+    // T1: Time to embed query text
+    var swEmbed = Stopwatch.StartNew();
+    var queryEmbeddings = await embeddingService.GenerateEmbeddingsAsync([query], kernel: kernel);
+    swEmbed.Stop();
+    long t1EmbedMs = swEmbed.ElapsedMilliseconds;
+
+    // T2: Time to search HNSW index
+    var swSearch = Stopwatch.StartNew();
+#pragma warning disable CS0618
+    var searchResults = await qdrantClient.SearchAsync(
+        collectionName: collectionName,
+        vector: queryEmbeddings[0].ToArray(),
+        limit: 1
+    );
+#pragma warning restore CS0618
+    swSearch.Stop();
+    long t2SearchMs = swSearch.ElapsedMilliseconds;
+
+    // Display telemetry & top match
+    Console.ForegroundColor = ConsoleColor.Magenta;
+    Console.WriteLine($"\n[Latency Telemetry] Embedding (T1): {t1EmbedMs} ms | HNSW Search (T2): {t2SearchMs} ms | Total: {t1EmbedMs + t2SearchMs} ms");
+    Console.ResetColor();
+
+    foreach (var hit in searchResults)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"Match Score   : {hit.Score:F4} (Cosine Similarity)");
+        Console.WriteLine($"Document ID   : {hit.Payload["docId"].StringValue}");
+        Console.WriteLine($"Category      : {hit.Payload["category"].StringValue}");
+        Console.WriteLine($"Retrieved Text: {hit.Payload["content"].StringValue}");
+        Console.ResetColor();
+    }
+}
